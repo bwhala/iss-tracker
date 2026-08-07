@@ -47,6 +47,20 @@ _MAX_RECOVERY_ATTEMPTS = 3
 # eliminate visible angular jumps under transient stalls.
 _FRAME_RESYNC_THRESHOLD = 4
 
+# Telemetry older than this is flagged on the HUD: the OVER cell switches to
+# an amber NO LINK indicator and the LAST readout goes humanized (12m / 47h).
+_STALE_DATA_SEC = 600.0
+
+
+def _format_age(age_sec: int) -> str:
+    """Humanize a data age: 38s → 12m → 47h. Keeps the LAST cell readable
+    during long outages instead of overflowing with a raw seconds count."""
+    if age_sec < 60:
+        return f"{age_sec}s"
+    if age_sec < 3600:
+        return f"{age_sec // 60}m"
+    return f"{age_sec // 3600}h"
+
 RGB = Tuple[int, int, int]
 
 
@@ -358,9 +372,11 @@ class LcdDisplay:
             gx0, gy0, gx0 + globe_size - 1, gy0 + globe_size - 1,
         )
 
-        # Pre-rendered frame caches
+        # Pre-rendered frame caches. frame_cache (PIL images) only exists
+        # during generation/conversion; render time uses frame_np_cache
+        # (RGB565 big-endian numpy arrays) exclusively.
         self.frame_cache: List[Image.Image] = []
-        self.frame_bytes_cache: List[bytes] = []
+        self.frame_np_cache: List[np.ndarray] = []
         self.num_frames = THEME.globe.num_frames
         self.frames_generated = False
 
@@ -565,9 +581,10 @@ class LcdDisplay:
         alt_val = f"{alt_km:,.0f}"
         vel_val = f"{vel_kmh:,.0f}"
         age_sec = int(telemetry.data_age_sec)
-        age_val = f"{age_sec}s"
+        age_val = _format_age(age_sec)
+        stale = telemetry.data_age_sec >= _STALE_DATA_SEC
 
-        cache_key = f"{lat_val}|{lon_val}|{alt_val}|{vel_val}|{age_sec}"
+        cache_key = f"{lat_val}|{lon_val}|{alt_val}|{vel_val}|{age_val}|{int(stale)}"
 
         w = self.width
         g = self._hud_grid
@@ -593,9 +610,16 @@ class LcdDisplay:
         draw.text((lon_x, label_y), "LON", fill=lon_el.label.color, font=lon_el.label.font)
         draw.text((lon_x, value_y), lon_val, fill=lon_el.value.color, font=lon_el.value.font)
 
-        # Region indicator (right-aligned)
+        # Region indicator (right-aligned). During a prolonged outage the
+        # position is a stale hold, so the region is unknown — flag NO LINK
+        # in amber (Boeing caution color, shared with the LAST readout).
         over_el = self._resolved["over"]
-        region = get_common_area_name(lat, lon)
+        if stale:
+            region = "NO LINK"
+            region_color = self._resolved["age"].value.color
+        else:
+            region = get_common_area_name(lat, lon)
+            region_color = over_el.value.color
         right_edge = w - g
         over_label_w = draw.textbbox((0, 0), "OVER", font=over_el.label.font)[2]
         draw.text((right_edge - over_label_w, label_y), "OVER", fill=over_el.label.color, font=over_el.label.font)
@@ -609,11 +633,11 @@ class LcdDisplay:
             total_w = sum(word_widths) + tight_gap * (len(words) - 1)
             x = right_edge - total_w
             for i, w_ in enumerate(words):
-                draw.text((x, value_y), w_, fill=over_el.value.color, font=over_el.value.font)
+                draw.text((x, value_y), w_, fill=region_color, font=over_el.value.font)
                 x += word_widths[i] + tight_gap
         else:
             region_text_w = draw.textbbox((0, 0), region, font=over_el.value.font)[2]
-            draw.text((right_edge - region_text_w, value_y), region, fill=over_el.value.color, font=over_el.value.font)
+            draw.text((right_edge - region_text_w, value_y), region, fill=region_color, font=over_el.value.font)
 
         # ── Bottom bar — clear before drawing into the caller-provided buffer ──
         draw = ImageDraw.Draw(bot_img)
@@ -877,30 +901,90 @@ class LcdDisplay:
         rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
         return rgb565.astype('>u2').tobytes()
 
-    def _precompute_rgb565(self):
-        """Pre-compute RGB565 data for all cached frames.
+    def _rgb565_cache_path(self) -> Path:
+        return self.cache_dir / f"globe_{self.num_frames}f_rgb565_{self.width}x{self.height}.npy"
 
-        Stores bytes (for display_raw) and big-endian numpy uint16 arrays
-        (for np.copyto frame copies and partial-update region extraction).
+    def _load_rgb565_cache(self) -> bool:
+        """Load pre-converted RGB565 frames from disk, skipping PIL entirely.
+
+        The conversion takes ~4.5 minutes on a Pi 3, which made every service
+        restart a long blank-screen event; loading the persisted result takes
+        seconds. Returns True on success.
         """
+        path = self._rgb565_cache_path()
+        if not path.exists():
+            return False
+        source = self.cache_dir / f"globe_{self.num_frames}f.npz"
+        try:
+            if source.exists() and source.stat().st_mtime > path.stat().st_mtime:
+                logger.info("RGB565 cache older than globe frame cache, recomputing")
+                return False
+            stacked = np.load(path)
+            expected = (self.num_frames, self.height, self.width)
+            if stacked.dtype != np.dtype('>u2') or stacked.shape != expected:
+                logger.warning(
+                    "RGB565 cache mismatch (dtype=%s shape=%s, expected %s), recomputing",
+                    stacked.dtype, stacked.shape, expected,
+                )
+                return False
+            # Per-frame views into the single stacked array (no copies)
+            self.frame_np_cache = [stacked[i] for i in range(self.num_frames)]
+            logger.info("Loaded %d RGB565 frames from cache", self.num_frames)
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to load RGB565 cache: {e}, recomputing")
+            return False
+
+    def _precompute_rgb565(self):
+        """Pre-compute RGB565 data for all cached frames and persist to disk.
+
+        Produces big-endian numpy uint16 arrays (for np.copyto frame copies
+        and partial-update region extraction). No-op when the frames were
+        already loaded from the RGB565 disk cache.
+        """
+        if self.frame_np_cache:
+            return
         logger.info("Pre-computing RGB565 frame data...")
-        self.frame_bytes_cache = []
-        self.frame_np_cache: List[np.ndarray] = []
-        for frame in self.frame_cache:
+        # Single stacked big-endian array: per-frame views share this one
+        # backing buffer, and assignment into it converts from native order
+        # exactly once. (np.stack must NOT be used here — it silently
+        # produces native byte order, which would byte-swap on every frame
+        # copy in the render hot path.)
+        stacked = np.empty(
+            (len(self.frame_cache), self.height, self.width), dtype='>u2'
+        )
+        for i, frame in enumerate(self.frame_cache):
             img_np = np.array(frame)
             r = img_np[..., 0].astype(np.uint16)
             g = img_np[..., 1].astype(np.uint16)
             b = img_np[..., 2].astype(np.uint16)
-            rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
-            frame_be = rgb565.astype('>u2')
-            self.frame_np_cache.append(frame_be)
-            self.frame_bytes_cache.append(frame_be.tobytes())
-        logger.info(f"Pre-computed {len(self.frame_bytes_cache)} frames")
+            stacked[i] = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+        self.frame_np_cache = [stacked[i] for i in range(len(self.frame_cache))]
+        logger.info(f"Pre-computed {len(self.frame_np_cache)} frames")
+
+        try:
+            np.save(self._rgb565_cache_path(), stacked)
+            logger.info("RGB565 cache saved: %s", self._rgb565_cache_path().name)
+        except Exception as e:
+            logger.warning(f"Failed to save RGB565 cache: {e}")
+
+        # Free the PIL source frames — render time only touches frame_np_cache,
+        # and the PIL cache holds ~110 MB at 320x480 with 240 frames.
+        self.frame_cache = []
 
     # ─── Frame cache ──────────────────────────────────────────────────────
 
     def _load_or_generate_frames(self):
-        """Load pre-rendered frames from cache or generate them."""
+        """Load pre-rendered frames from cache or generate them.
+
+        Fast path: a valid RGB565 disk cache skips PIL frame loading and the
+        multi-minute RGB565 conversion entirely.
+        """
+        if self._load_rgb565_cache():
+            self.frames_generated = True
+            self._update_globe_geometry()
+            return
+
         cache_file = self.cache_dir / f"globe_{self.num_frames}f.npz"
 
         if cache_file.exists():
@@ -991,11 +1075,11 @@ class LcdDisplay:
         logger.info("Frame generation complete!")
 
     def _update_globe_geometry(self):
-        """Compute globe center and radius from the rendered frames."""
-        if not self.frame_cache:
-            return
-        # All frames are the same size, so use the first one
-        # The globe is rendered at globe_scale of the smaller dimension
+        """Compute globe center and radius.
+
+        Depends only on configured dimensions and globe_scale — matches the
+        size the frames were rendered at, whichever cache they came from.
+        """
         globe_size = int(min(self.width, self.height) * self.globe_scale)
         self.globe_center_x = self.width // 2
         self.globe_center_y = self.height // 2

@@ -100,15 +100,22 @@ class AstrosClient:
                 timestamp=time.time(),
             )
             with self._lock:
+                recovered_after = self._consecutive_failures
                 self._cached = new_data
                 self._last_fetch = time.monotonic()
                 self._consecutive_failures = 0
+            if recovered_after > 0:
+                logger.info("Astros API recovered after %d failures", recovered_after)
             logger.debug("Fetched astros: %d people", new_data.count)
         except Exception as e:
             with self._lock:
                 self._consecutive_failures += 1
                 failures = self._consecutive_failures
-            logger.warning("Astros API failed (%dx): %s", failures, e)
+            # First few failures log loud; after that, one per ~10 min
+            # (retry cadence is 60s) so an extended outage doesn't churn
+            # the journal on the SD card.
+            if failures <= 3 or failures % 10 == 0:
+                logger.warning("Astros API failed (%dx): %s", failures, e)
 
     def _fetch_loop(self) -> None:
         """Background loop that refreshes the cache periodically."""

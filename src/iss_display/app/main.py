@@ -46,6 +46,16 @@ _THREAD_STALE_SEC = 120.0
 # Data staleness: if no successful fetch in this many seconds, force restart
 _MAX_DATA_AGE_SEC = 600.0
 
+# Position extrapolation cap: never dead-reckon further than this past the
+# last real fix. Beyond it the marker holds at the last extrapolated point
+# instead of drifting (unbounded lat drift pins the marker to a pole within
+# hours of a network outage — seen in the Aug 2026 brcmfmac incident).
+_MAX_EXTRAPOLATION_SEC = 300.0
+
+# Futile-restart log decimation: during a prolonged outage the fetch thread
+# is restarted every ~30s forever; log the first few then one per this many.
+_LOG_EVERY_N_RESTARTS = 20  # ~one WARNING per 10 minutes
+
 # Render thread: consider stuck if no heartbeat for this long
 _RENDER_STALE_SEC = 10.0
 
@@ -106,9 +116,22 @@ class ISSOrbitInterpolator:
         self._lock = threading.Lock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        # Interruptible sleep for the fetch loop (set by stop/restart)
+        self._stop_evt = threading.Event()
+        # Generation token: a restarted loop gets a new generation, and stale
+        # threads that outlived their 2s join (stuck in a backoff sleep) exit
+        # at their next check instead of looping forever alongside the new
+        # thread. Without this, prolonged outages slowly accumulate orphan
+        # fetch threads, all hammering the API.
+        self._generation = 0
 
-        # API backoff state
+        # API backoff state. Not reset on thread restart — during a prolonged
+        # outage this keeps the backoff pinned at max instead of snapping back
+        # to the short interval every time the health check recycles the thread.
         self._consecutive_failures = 0
+
+        # Health-driven restarts since the last successful fetch (log decimation)
+        self._consecutive_restarts = 0
 
         # Stats
         self._api_calls = 0
@@ -117,18 +140,34 @@ class ISSOrbitInterpolator:
         # Thread health: monotonic timestamp of last loop iteration
         self._thread_heartbeat: float = 0.0
 
-    def start(self):
-        """Start background API fetching."""
+    def start(self, *, quiet: bool = False, initial_fetch: bool = True):
+        """Start background API fetching.
+
+        quiet suppresses the INFO start log — used by restart_if_needed's
+        decimated restarts so an extended outage doesn't flood the journal.
+        initial_fetch=False skips the synchronous first fetch: on the restart
+        path that fetch runs on the main-loop thread and can stall it for
+        ~20s against a black-holed network, flirting with the watchdog's
+        30s staleness threshold.
+        """
         self._running = True
         self._thread_heartbeat = time.monotonic()
-        self._thread = threading.Thread(target=self._fetch_loop, daemon=True)
+        self._generation += 1
+        self._thread = threading.Thread(
+            target=self._fetch_loop, args=(self._generation,), daemon=True
+        )
         self._thread.start()
-        self._do_fetch()
-        logger.info(f"ISS Interpolator started (API interval: {self.api_interval}s)")
+        if initial_fetch:
+            self._do_fetch()
+        logger.log(
+            logging.DEBUG if quiet else logging.INFO,
+            "ISS Interpolator started (API interval: %ss)", self.api_interval,
+        )
 
     def stop(self):
         """Stop background fetching."""
         self._running = False
+        self._stop_evt.set()
         if self._thread:
             self._thread.join(timeout=2.0)
         logger.info(
@@ -155,18 +194,33 @@ class ISSOrbitInterpolator:
     def restart_if_needed(self) -> bool:
         """Restart the fetch thread if it has died. Returns True if restarted."""
         if self.is_healthy():
+            if self._consecutive_restarts > 0:
+                logger.info(
+                    "Fetch thread recovered after %d restarts",
+                    self._consecutive_restarts,
+                )
+                self._consecutive_restarts = 0
             return False
-        logger.warning(
-            "Fetch thread unhealthy, restarting (failures=%d, data_age=%.0fs)",
-            self._consecutive_failures,
-            time.time() - self._last_fetch_time if self._last_fetch_time > 0 else -1,
-        )
+        self._consecutive_restarts += 1
+        # During a dead-network outage this path fires every ~30s forever;
+        # decimate after the first few so the journal (on SD card) isn't
+        # churned with thousands of identical warnings.
+        loud = (self._consecutive_restarts <= 3
+                or self._consecutive_restarts % _LOG_EVERY_N_RESTARTS == 0)
+        if loud:
+            logger.warning(
+                "Fetch thread unhealthy, restarting (restart #%d, failures=%d, data_age=%.0fs)",
+                self._consecutive_restarts,
+                self._consecutive_failures,
+                time.time() - self._last_fetch_time if self._last_fetch_time > 0 else -1,
+            )
         self._running = False
+        self._stop_evt.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2.0)
-        self._consecutive_failures = 0
+        self._stop_evt.clear()
         self.client.reset_session()
-        self.start()
+        self.start(quiet=not loud, initial_fetch=False)
         return True
 
     def get_telemetry(self) -> ISSFix:
@@ -187,13 +241,18 @@ class ISSOrbitInterpolator:
             now = time.time()
             dt = now - self._last_fetch_time
 
-            new_lon = self._last_fix.longitude + (self._lon_velocity * dt)
+            # Dead-reckon only within a bounded window past the last real fix.
+            # data_age_sec below still reports the true age so the HUD and
+            # staleness logic stay honest.
+            dt_pos = min(dt, _MAX_EXTRAPOLATION_SEC)
+
+            new_lon = self._last_fix.longitude + (self._lon_velocity * dt_pos)
             while new_lon > 180:
                 new_lon -= 360
             while new_lon < -180:
                 new_lon += 360
 
-            new_lat = self._last_fix.latitude + (self._lat_velocity * dt)
+            new_lat = self._last_fix.latitude + (self._lat_velocity * dt_pos)
             new_lat = max(-90, min(90, new_lat))
 
             self._interpolated_frames += 1
@@ -248,24 +307,32 @@ class ISSOrbitInterpolator:
             self._consecutive_failures += 1
             # Do NOT update _last_fix or _last_fetch_time — preserving the old
             # timestamp lets data_age_sec in get_telemetry() grow correctly.
-            if self.client._last_fix is not None:
+            # Decimate after the first few failures — a dead network otherwise
+            # produces thousands of identical multi-line warnings.
+            if self._consecutive_failures <= 3 or self._consecutive_failures % 20 == 0:
+                detail = ("using last known position"
+                          if self.client._last_fix is not None
+                          else "no cached position available")
                 logger.warning(
-                    f"All APIs failed ({self._consecutive_failures}x), using last known position. "
-                    f"Errors: {e}"
-                )
-            else:
-                logger.warning(
-                    f"All APIs failed ({self._consecutive_failures}x), no cached position available. "
-                    f"Errors: {e}"
+                    "All APIs failed (%dx), %s. Errors: %s",
+                    self._consecutive_failures, detail, e,
                 )
 
         except Exception:
             self._consecutive_failures += 1
             logger.exception("API fetch failed (%dx)", self._consecutive_failures)
 
-    def _fetch_loop(self):
-        """Background loop that fetches periodically with exponential backoff."""
-        while self._running:
+    def _fetch_loop(self, generation: int):
+        """Background loop that fetches periodically with exponential backoff.
+
+        Exits when stopped OR when superseded by a newer generation (restart
+        spawned a replacement while this thread was stuck in a sleep/fetch).
+        """
+        def current() -> bool:
+            return self._running and generation == self._generation
+
+        first = True
+        while current():
             try:
                 self._thread_heartbeat = time.monotonic()
 
@@ -279,12 +346,20 @@ class ISSOrbitInterpolator:
                 else:
                     backoff = self.api_interval
 
-                time.sleep(backoff)
-                if self._running:
+                # First attempt after a (re)start happens quickly regardless of
+                # backoff — restarts come every ~30s during an outage, and a
+                # full backoff wait would mean the thread gets superseded
+                # before it ever tries (data would then never refresh).
+                if first:
+                    backoff = min(backoff, 5.0)
+                    first = False
+
+                self._stop_evt.wait(backoff)
+                if current():
                     self._do_fetch()
             except Exception:
                 logger.exception("Unexpected error in fetch loop")
-                time.sleep(5.0)
+                self._stop_evt.wait(5.0)
 
 
 class ViewToggle:

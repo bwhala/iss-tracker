@@ -1,0 +1,11 @@
+[Unit]
+Description=Run network connectivity watchdog every 2 minutes
+
+[Timer]
+# Give the network stack time to come up after boot before the first check
+OnBootSec=3min
+OnUnitActiveSec=2min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
