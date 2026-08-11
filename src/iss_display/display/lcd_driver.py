@@ -63,12 +63,30 @@ def _format_age(age_sec: int) -> str:
 
 RGB = Tuple[int, int, int]
 
+# Characters pre-rendered into each HUD glyph atlas. Covers telemetry values
+# (digits, degree, N/S/E/W, units), labels, and every region name that
+# geography.get_common_area_name can return, plus NO LINK.
+_ATLAS_CHARSET = (
+    "0123456789"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "abcdefghijklmnopqrstuvwxyz"
+    " .,°'/-"
+)
+
 
 @dataclass
 class _ResolvedText:
-    """Fully resolved text style with loaded PIL font."""
+    """Fully resolved text style with loaded PIL font and glyph atlas.
+
+    The atlas maps each character to a pre-rendered RGB565 big-endian tile
+    (glyph on the HUD background color). Runtime HUD composition pastes
+    these tiles with numpy instead of calling PIL text rendering, which
+    holds the GIL for ~30 ms per HUD pass and stalled the render thread
+    once per composer tick (the "hitch every second" bug).
+    """
     color: RGB
     font: ImageFont.FreeTypeFont
+    atlas: Optional[dict] = None
 
 
 @dataclass
@@ -545,9 +563,35 @@ class LcdDisplay:
         # for HUD refresh rate, not a globe-smoothness knob.
         self._hud_min_render_interval = THEME.hud.min_render_interval_sec
 
-        # Pre-allocated Image objects — reused on every HUD redraw to avoid allocation
-        self._hud_top_img = Image.new('RGB', (self.width, self._hud_top_height), self._hud_bg)
-        self._hud_bot_img = Image.new('RGB', (self.width, self._hud_bot_height), self._hud_bg)
+        # ── Glyph atlases + RGB565 bar buffers (PIL-free HUD hot path) ──
+        # One atlas per unique (font, color) pair; the NO LINK indicator
+        # reuses the age element's atlas (same font/size, amber color).
+        atlas_cache: dict = {}
+
+        def atlas_for(font, color):
+            key = (id(font), color)
+            if key not in atlas_cache:
+                atlas_cache[key] = self._build_glyph_atlas(font, color)
+            return atlas_cache[key]
+
+        for el in self._resolved.values():
+            el.label.atlas = atlas_for(el.label.font, el.label.color)
+            el.value.atlas = atlas_for(el.value.font, el.value.color)
+            if el.unit is not None:
+                el.unit.atlas = atlas_for(el.unit.font, el.unit.color)
+
+        # NO LINK: OVER-cell font in the age (amber) color
+        self._no_link_atlas = atlas_for(
+            self._resolved["over"].value.font, self._resolved["age"].value.color
+        )
+
+        self._hud_bg565 = _rgb_to_rgb565(*self._hud_bg)
+        self._hud_top_border565 = _rgb_to_rgb565(*self._hud_top_border)
+        self._hud_bot_border565 = _rgb_to_rgb565(*self._hud_bot_border)
+
+        # Composition buffers, owned by the single composer caller
+        self._hud_top_buf = np.empty((self._hud_top_height, self.width), dtype='>u2')
+        self._hud_bot_buf = np.empty((self._hud_bot_height, self.width), dtype='>u2')
 
     def _get_font(self, font_path: Optional[str], size: int) -> ImageFont.FreeTypeFont:
         """Load a font at a given size, using the cache."""
@@ -559,13 +603,66 @@ class LcdDisplay:
             self._font_cache[key] = ImageFont.truetype(path, size)
         return self._font_cache[key]
 
-    def render_hud_into(self, telemetry: "ISSFix",
-                        top_img: Image.Image, bot_img: Image.Image) -> Tuple[bytes, bytes, str]:
-        """Render the HUD bars into the given image buffers and return RGB565 bytes.
+    def _build_glyph_atlas(self, font, color: RGB) -> dict:
+        """Pre-render _ATLAS_CHARSET as RGB565 tiles on the HUD background.
 
-        Pure-ish: only writes to the passed images. Does not mutate any LcdDisplay
-        state, so it is safe to call from the HudComposer thread with its own
-        scratch buffers while the render thread reads the committed bytes.
+        Each tile is one character rendered by PIL exactly as draw.text()
+        would at a top-left anchor, so numpy-pasting tiles at cumulative
+        advances is pixel-identical to the old full-string PIL rendering
+        (the HUD font is monospace: no kerning). One-time startup cost so
+        the per-second HUD recomposition never touches PIL again.
+        """
+        try:
+            ascent, descent = font.getmetrics()
+            tile_h = ascent + descent
+        except AttributeError:  # bitmap fallback font
+            tile_h = font.getbbox("Ag")[3] + 2
+        atlas: dict = {}
+        for ch in _ATLAS_CHARSET:
+            adv = max(1, int(round(font.getlength(ch))))
+            img = Image.new('RGB', (adv, tile_h), self._hud_bg)
+            ImageDraw.Draw(img).text((0, 0), ch, fill=color, font=font)
+            arr = np.array(img)
+            r = arr[..., 0].astype(np.uint16)
+            g = arr[..., 1].astype(np.uint16)
+            b = arr[..., 2].astype(np.uint16)
+            atlas[ch] = (((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)).astype('>u2')
+        return atlas
+
+    @staticmethod
+    def _text_width(text: str, atlas: dict) -> int:
+        return sum(atlas[ch].shape[1] for ch in text if ch in atlas)
+
+    @staticmethod
+    def _blit_text(buf: np.ndarray, x: int, y: int, text: str, atlas: dict) -> int:
+        """Paste glyph tiles into a bar buffer. Returns the end x position."""
+        H, W = buf.shape
+        for ch in text:
+            tile = atlas.get(ch)
+            if tile is None:
+                continue
+            h, w = tile.shape
+            if x >= W:
+                break
+            hc = min(h, H - y)
+            wc = min(w, W - x)
+            if hc > 0 and wc > 0:
+                buf[y:y + hc, x:x + wc] = tile[:hc, :wc]
+            x += w
+        return x
+
+    def render_hud_bytes(self, telemetry: "ISSFix") -> Tuple[bytes, bytes, str]:
+        """Compose the HUD bars from glyph atlases and return RGB565 bytes.
+
+        Pure numpy tile pastes — no PIL in this path. The old PIL version
+        held the GIL for ~30 ms per pass, which stalled the render thread
+        mid-frame once per composer tick and showed up as a rhythmic hitch
+        in the globe rotation. This version costs ~1 ms.
+
+        Must only be called from one thread at a time (the composer; plus
+        the single synchronous call at startup before the composer starts) —
+        it composes into shared per-bar buffers. The returned bytes are
+        copies and safe to hand across threads.
 
         Returns (top_bytes, bottom_bytes, cache_key).
         """
@@ -588,27 +685,25 @@ class LcdDisplay:
 
         w = self.width
         g = self._hud_grid
-        top_h = self._hud_top_height
-        bot_h = self._hud_bot_height
         label_y = self._hud_label_y
         value_y = self._hud_value_y
 
-        # ── Top bar — clear before drawing into the caller-provided buffer ──
-        draw = ImageDraw.Draw(top_img)
-        draw.rectangle([0, 0, w, top_h], fill=self._hud_bg)
-        draw.line([0, top_h - 1, w, top_h - 1], fill=self._hud_top_border)
+        # ── Top bar ──
+        top = self._hud_top_buf
+        top[:] = self._hud_bg565
+        top[-1, :] = self._hud_top_border565
 
         # LAT cell
         lat_el = self._resolved["lat"]
         lat_x = g
-        draw.text((lat_x, label_y), "LAT", fill=lat_el.label.color, font=lat_el.label.font)
-        draw.text((lat_x, value_y), lat_val, fill=lat_el.value.color, font=lat_el.value.font)
+        self._blit_text(top, lat_x, label_y, "LAT", lat_el.label.atlas)
+        self._blit_text(top, lat_x, value_y, lat_val, lat_el.value.atlas)
 
         # LON cell
         lon_el = self._resolved["lon"]
         lon_x = lat_x + lat_el.cell_width + g
-        draw.text((lon_x, label_y), "LON", fill=lon_el.label.color, font=lon_el.label.font)
-        draw.text((lon_x, value_y), lon_val, fill=lon_el.value.color, font=lon_el.value.font)
+        self._blit_text(top, lon_x, label_y, "LON", lon_el.label.atlas)
+        self._blit_text(top, lon_x, value_y, lon_val, lon_el.value.atlas)
 
         # Region indicator (right-aligned). During a prolonged outage the
         # position is a stale hold, so the region is unknown — flag NO LINK
@@ -616,61 +711,59 @@ class LcdDisplay:
         over_el = self._resolved["over"]
         if stale:
             region = "NO LINK"
-            region_color = self._resolved["age"].value.color
+            region_atlas = self._no_link_atlas
         else:
             region = get_common_area_name(lat, lon)
-            region_color = over_el.value.color
+            region_atlas = over_el.value.atlas
         right_edge = w - g
-        over_label_w = draw.textbbox((0, 0), "OVER", font=over_el.label.font)[2]
-        draw.text((right_edge - over_label_w, label_y), "OVER", fill=over_el.label.color, font=over_el.label.font)
+        over_label_w = self._text_width("OVER", over_el.label.atlas)
+        self._blit_text(top, right_edge - over_label_w, label_y, "OVER", over_el.label.atlas)
         # Render multi-word regions with a tighter gap than the mono font's
         # full-width space (e.g. "N. America" → "N." + small gap + "America").
         words = region.split(" ")
         if len(words) > 1:
-            space_w = draw.textbbox((0, 0), " ", font=over_el.value.font)[2]
+            space_w = self._text_width(" ", region_atlas)
             tight_gap = max(1, space_w // 3)
-            word_widths = [draw.textbbox((0, 0), w_, font=over_el.value.font)[2] for w_ in words]
+            word_widths = [self._text_width(w_, region_atlas) for w_ in words]
             total_w = sum(word_widths) + tight_gap * (len(words) - 1)
             x = right_edge - total_w
             for i, w_ in enumerate(words):
-                draw.text((x, value_y), w_, fill=region_color, font=over_el.value.font)
+                self._blit_text(top, x, value_y, w_, region_atlas)
                 x += word_widths[i] + tight_gap
         else:
-            region_text_w = draw.textbbox((0, 0), region, font=over_el.value.font)[2]
-            draw.text((right_edge - region_text_w, value_y), region, fill=region_color, font=over_el.value.font)
+            region_text_w = self._text_width(region, region_atlas)
+            self._blit_text(top, right_edge - region_text_w, value_y, region, region_atlas)
 
-        # ── Bottom bar — clear before drawing into the caller-provided buffer ──
-        draw = ImageDraw.Draw(bot_img)
-        draw.rectangle([0, 0, w, bot_h], fill=self._hud_bg)
-        draw.line([0, 0, w, 0], fill=self._hud_bot_border)
+        # ── Bottom bar ──
+        bot = self._hud_bot_buf
+        bot[:] = self._hud_bg565
+        bot[0, :] = self._hud_bot_border565
 
         # ALT cell
         alt_el = self._resolved["alt"]
         alt_x = g
-        draw.text((alt_x, label_y), "ALT", fill=alt_el.label.color, font=alt_el.label.font)
-        draw.text((alt_x, value_y), alt_val, fill=alt_el.value.color, font=alt_el.value.font)
-        alt_text_w = draw.textbbox((0, 0), alt_val, font=alt_el.value.font)[2]
-        draw.text((alt_x + alt_text_w + self._hud_unit_gap, value_y + alt_el.unit_baseline_offset),
-                  "km", fill=alt_el.unit.color, font=alt_el.unit.font)
+        self._blit_text(bot, alt_x, label_y, "ALT", alt_el.label.atlas)
+        alt_end = self._blit_text(bot, alt_x, value_y, alt_val, alt_el.value.atlas)
+        self._blit_text(bot, alt_end + self._hud_unit_gap,
+                        value_y + alt_el.unit_baseline_offset, "km", alt_el.unit.atlas)
 
         # VEL cell
         vel_el = self._resolved["vel"]
         vel_x = alt_x + alt_el.cell_width + g
-        draw.text((vel_x, label_y), "VEL", fill=vel_el.label.color, font=vel_el.label.font)
-        draw.text((vel_x, value_y), vel_val, fill=vel_el.value.color, font=vel_el.value.font)
-        vel_text_w = draw.textbbox((0, 0), vel_val, font=vel_el.value.font)[2]
-        draw.text((vel_x + vel_text_w + self._hud_unit_gap, value_y + vel_el.unit_baseline_offset),
-                  "km/h", fill=vel_el.unit.color, font=vel_el.unit.font)
+        self._blit_text(bot, vel_x, label_y, "VEL", vel_el.label.atlas)
+        vel_end = self._blit_text(bot, vel_x, value_y, vel_val, vel_el.value.atlas)
+        self._blit_text(bot, vel_end + self._hud_unit_gap,
+                        value_y + vel_el.unit_baseline_offset, "km/h", vel_el.unit.atlas)
 
         # Data age indicator (right-aligned)
         age_el = self._resolved["age"]
         right_edge = w - g
-        age_label_w = draw.textbbox((0, 0), "LAST", font=age_el.label.font)[2]
-        draw.text((right_edge - age_label_w, label_y), "LAST", fill=age_el.label.color, font=age_el.label.font)
-        age_text_w = draw.textbbox((0, 0), age_val, font=age_el.value.font)[2]
-        draw.text((right_edge - age_text_w, value_y), age_val, fill=age_el.value.color, font=age_el.value.font)
+        age_label_w = self._text_width("LAST", age_el.label.atlas)
+        self._blit_text(bot, right_edge - age_label_w, label_y, "LAST", age_el.label.atlas)
+        age_text_w = self._text_width(age_val, age_el.value.atlas)
+        self._blit_text(bot, right_edge - age_text_w, value_y, age_val, age_el.value.atlas)
 
-        return self._image_to_rgb565_bytes(top_img), self._image_to_rgb565_bytes(bot_img), cache_key
+        return top.tobytes(), bot.tobytes(), cache_key
 
     def apply_hud_bytes(self, top_bytes: bytes, bottom_bytes: bytes, cache_key: str) -> None:
         """Atomically swap in newly-rendered HUD bytes (called from HudComposer).
@@ -959,6 +1052,11 @@ class LcdDisplay:
             g = img_np[..., 1].astype(np.uint16)
             b = img_np[..., 2].astype(np.uint16)
             stacked[i] = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+            # Free each PIL frame as soon as it's converted: holding all of
+            # them alongside the growing stacked array put the peak at
+            # ~2.4 KB/px instead of ~1 KB/px, which at 480 frames would brush
+            # the service's MemoryHigh and re-trigger reclaim thrash.
+            self.frame_cache[i] = None
         self.frame_np_cache = [stacked[i] for i in range(len(self.frame_cache))]
         logger.info(f"Pre-computed {len(self.frame_np_cache)} frames")
 

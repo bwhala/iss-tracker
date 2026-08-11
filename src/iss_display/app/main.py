@@ -14,8 +14,6 @@ from collections import deque
 from typing import Sequence, Optional
 import threading
 
-from PIL import Image
-
 from iss_display.config import Settings
 from iss_display.display.lcd_driver import LcdDisplay
 from iss_display.data.iss_client import ISSClient, ISSFetchError, ISSFix
@@ -448,12 +446,11 @@ class WatchdogPinger(threading.Thread):
 
 
 class HudComposer(threading.Thread):
-    """Background thread that renders HUD bars off the render-thread critical path.
+    """Background thread that composes HUD bars off the render-thread critical path.
 
-    The HUD's PIL drawing (text rendering with TrueType fonts + RGB565 conversion)
-    takes ~80 ms on a Pi 3 — long enough to cause visible globe-rotation hitches
-    if it ran inline. This thread does that work in parallel: PIL releases the
-    GIL during heavy ops, so it overlaps with SPI writes in the render thread.
+    Composition is glyph-atlas numpy pastes (~1 ms) — the old PIL text
+    rendering held the GIL for ~30 ms per pass, which stalled the render
+    thread mid-frame once per tick and read as a rhythmic rotation hitch.
 
     Pacing: wakes every ``min_render_interval_sec`` (theme.toml) and re-renders
     if telemetry has been set. The render thread polls per-bar version counters
@@ -467,10 +464,6 @@ class HudComposer(threading.Thread):
         self._lock = threading.Lock()
         self._telemetry: Optional[ISSFix] = None
         self._wakeup = threading.Event()
-        # Private scratch images — never shared with the render thread, so PIL
-        # operations here cannot tear concurrent reads of LcdDisplay state.
-        self._top_img = Image.new('RGB', (lcd_display.width, lcd_display._hud_top_height), lcd_display._hud_bg)
-        self._bot_img = Image.new('RGB', (lcd_display.width, lcd_display._hud_bot_height), lcd_display._hud_bg)
         self._interval = lcd_display._hud_min_render_interval
 
     def set_telemetry(self, telemetry: ISSFix) -> None:
@@ -494,9 +487,7 @@ class HudComposer(threading.Thread):
             if telemetry is None:
                 continue
             try:
-                top_b, bot_b, key = self._lcd.render_hud_into(
-                    telemetry, self._top_img, self._bot_img,
-                )
+                top_b, bot_b, key = self._lcd.render_hud_bytes(telemetry)
                 self._lcd.apply_hud_bytes(top_b, bot_b, key)
             except Exception:
                 logger.exception("HudComposer render failed; will retry next tick")
@@ -751,9 +742,7 @@ def run_loop(settings: Settings) -> None:
         # has correct HUD bytes — the render thread starts immediately and
         # the composer's first scheduled wakeup is up to a full interval away.
         try:
-            top_b, bot_b, key = driver.render_hud_into(
-                telemetry, driver._hud_top_img, driver._hud_bot_img,
-            )
+            top_b, bot_b, key = driver.render_hud_bytes(telemetry)
             driver.apply_hud_bytes(top_b, bot_b, key)
         except Exception:
             logger.exception("Initial HUD render failed; first frames may show blank HUD")
