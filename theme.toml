@@ -12,7 +12,7 @@
 [globe]
 scale               = 0.70
 iss_orbit_scale     = 1.20
-num_frames          = 240
+num_frames          = 480
 rotation_period_sec = 14.0
 
 background          = [0, 0, 0]

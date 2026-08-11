@@ -19,9 +19,23 @@ A Raspberry Pi-powered display that tracks the International Space Station in re
 |-----------|---------|
 | **Raspberry Pi** | Model 3B or newer, running Raspberry Pi OS |
 | **LCD display** | Waveshare 3.5" RPi LCD (F) — 320x480, SPI, plugs directly onto the GPIO header |
+| **Power supply** | **5.1 V** / 2.5 A+ — the official Raspberry Pi supply is strongly recommended (see below) |
 | **Toggle switch** *(optional)* | Latching switch wired between GPIO 17 and GND to switch display views |
 
 > The display sits on top of the Pi — no breadboard or extra wiring needed unless you add the toggle switch.
+
+> ⚠️ **The power supply makes or breaks display performance.** The Pi throttles
+> whenever the 5 V rail dips below 4.63 V: the CPU is capped at half speed
+> (600 MHz) and the core clock — **which the SPI display bus is derived from** —
+> drops from 400 to 250 MHz. The result is a silently slow, jittery display
+> with no error message anywhere; a generic "5 V" phone charger typically sits
+> just above the trip point and sags below it under load, and a thin micro-USB
+> cable can ruin even a good adapter. This is why the official supply is
+> **5.1 V**: it holds voltage at the connector under full load. Check yours
+> with `vcgencmd get_throttled` — anything other than `throttled=0x0` means
+> power problems (bit 0 = under-voltage right now, bit 16 = it has happened
+> since boot). During development this exact issue silently halved this
+> project's frame rate for months.
 
 ---
 
@@ -215,7 +229,7 @@ journalctl -u net-watchdog -f
 | `GPIO_RST` | `27` | LCD reset pin |
 | `GPIO_BL` | `18` | LCD backlight pin |
 | `GPIO_TOGGLE` | `17` | View toggle switch pin |
-| `SPI_SPEED_HZ` | `48000000` | SPI clock speed (do not increase) |
+| `SPI_SPEED_HZ` | `48000000` | SPI clock speed. 66.7 MHz verified on this unit with a pinned 400 MHz core; per-panel — validate with `bench/display_bench.py` before raising |
 | `PREVIEW_ONLY` | `false` | Set to `true` to generate PNGs instead of driving the LCD |
 | `ISS_LOG_LEVEL` | `INFO` | Log verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
 
@@ -241,16 +255,16 @@ Styles cascade: `hud base → bar base → element override`. Set a style broadl
 
 ## Globe Frame Cache
 
-The 3D globe is rendered as 240 pre-computed frames using [Cartopy](https://scitools.org.uk/cartopy). Two caches live in `var/frame_cache/`:
+The 3D globe is rendered as 480 pre-computed frames (`num_frames` in `theme.toml`) using [Cartopy](https://scitools.org.uk/cartopy). Two caches live in `var/frame_cache/`:
 
-- `globe_240f.npz` — the rendered RGB frames (Cartopy output)
-- `globe_240f_rgb565_320x480.npy` — the display-ready RGB565 conversion
+- `globe_480f.npz` — the rendered RGB frames (Cartopy output)
+- `globe_480f_rgb565_320x480.npy` — the display-ready RGB565 conversion
 
 - **First run** — generates frames (~2–4 minutes on Pi 4, longer on Pi 3), then converts to RGB565 (~4.5 minutes on Pi 3) and caches both
 - **Subsequent runs** — loads the RGB565 cache directly in a few seconds (the `.npz` isn't even opened)
 - **Regenerate** — delete `var/frame_cache/` (needed after changing globe colors or `num_frames` in `theme.toml`); deleting only the `.npz` and regenerating it also invalidates the RGB565 cache automatically (mtime comparison)
 
-> **SPI bandwidth ceiling.** A full 320×480 RGB565 frame is 307 KB; over the 48 MHz SPI bus that's ~51 ms per frame, which caps full-frame writes at ~10–12 FPS realistic. The renderer mitigates this by sending only the globe disc (~17 ms) when the HUD hasn't changed and only the marker bbox (~1 ms) when the globe hasn't either. Don't expect 60 FPS — it's not physically possible on this hardware.
+> **SPI bandwidth ceiling.** A full 320×480 RGB565 frame is 307 KB. The SPI clock is derived from the Pi's **core clock** (SCLK = core / even divisor), so the requested `SPI_SPEED_HZ` only means what it says when the core clock is pinned (`core_freq=400` + `core_freq_min=400` in config.txt) and the PSU is healthy (`vcgencmd get_throttled` = `0x0`) — an under-volted or scaling core silently ran this bus at 25 MHz for months. At the measured 66.7 MHz (verified artifact-free on this panel; see `bench/RESULTS.md`), a full frame takes ~38 ms and a globe-disc region ~13 ms, supporting the 34 FPS rotation (480 frames / 14 s). Full-screen 60 FPS remains physically impossible (~148 Mbit/s needed), but disc-region updates have headroom to ~76 FPS.
 
 To speed things up, you can generate the cache on a faster machine and copy it over:
 
@@ -298,6 +312,16 @@ iss-tracker/
 
 **Display is blank or freezes after a few seconds**
 The SPI buffer size is probably still at the 4 KB default. Follow step 3 in Quick Start to increase it to 307,200 bytes, then reboot.
+
+**Globe rotation is slow or jittery**
+Almost always power. Run `vcgencmd get_throttled` — anything other than
+`throttled=0x0` means the Pi is (or has been) under-voltage and is silently
+running the CPU and the SPI display bus at reduced, fluctuating speed. Use a
+5.1 V supply (official recommended) and a short, thick USB cable, and verify
+`0x0` under load. Also pin the core clock (`core_freq=400` +
+`core_freq_min=400` in `/boot/firmware/config.txt`) so the SPI clock can't
+wander with system load. `bench/display_bench.py` measures the actual
+achieved SPI throughput and frame rates on your hardware.
 
 **Permission denied on SPI or GPIO**
 Add your user to the `gpio` and `spi` groups: `sudo usermod -a -G gpio,spi $USER`, then log out and back in.
