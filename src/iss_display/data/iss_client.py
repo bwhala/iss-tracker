@@ -59,7 +59,7 @@ class ISSClient:
         except Exception:
             logger.debug("ISS session close failed", exc_info=True)
         self._session = requests.Session()
-        logger.info("HTTP session recycled")
+        logger.debug("HTTP session recycled")
 
     def _build_api_list(self) -> list[str]:
         """Return the ordered list of URLs to try, including optional N2YO."""

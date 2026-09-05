@@ -1,0 +1,11 @@
+[Unit]
+Description=Network connectivity watchdog (staged recovery)
+# One-shot check invoked by net-watchdog.timer. See net-watchdog.sh for the
+# escalation policy and the 2026-08-05 brcmfmac incident that motivated it.
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/net-watchdog.sh
+# The script's internal timeouts total well under a minute; this is a backstop.
+TimeoutStartSec=90
+SyslogIdentifier=net-watchdog

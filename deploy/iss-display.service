@@ -14,15 +14,24 @@ EnvironmentFile=%h/iss-tracker/.env
 # Watchdog: systemd kills and restarts service if no ping within this window
 WatchdogSec=60s
 
+# Cold start (globe generation + RGB565 conversion) can take several minutes
+# on a Pi 3; READY=1 is only sent once the main loop is up. Warm starts with
+# the RGB565 disk cache are seconds.
+TimeoutStartSec=15min
+
 # Restart policy: 5s -> 10s -> 20s -> 40s -> 60s (5 steps)
 Restart=always
 RestartSec=5
 RestartSteps=5
 RestartMaxDelaySec=60
 
-# Resource limits (requires cgroup_enable=memory in cmdline.txt)
-MemoryMax=250M
-MemoryHigh=200M
+# Resource limits (requires cgroup_enable=memory in cmdline.txt).
+# Steady state is ~120 MB (RGB565 frames + Python); a cold cache rebuild
+# briefly holds PIL frames + RGB565 output together (~300 MB peak). The
+# previous 200M/250M limits kept the service permanently in memory.high
+# reclaim, thrashing ~230 MB of swap on the SD card.
+MemoryMax=450M
+MemoryHigh=380M
 
 # Graceful shutdown
 TimeoutStopSec=10

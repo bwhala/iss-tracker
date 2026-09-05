@@ -19,9 +19,23 @@ A Raspberry Pi-powered display that tracks the International Space Station in re
 |-----------|---------|
 | **Raspberry Pi** | Model 3B or newer, running Raspberry Pi OS |
 | **LCD display** | Waveshare 3.5" RPi LCD (F) — 320x480, SPI, plugs directly onto the GPIO header |
+| **Power supply** | **5.1 V** / 2.5 A+ — the official Raspberry Pi supply is strongly recommended (see below) |
 | **Toggle switch** *(optional)* | Latching switch wired between GPIO 17 and GND to switch display views |
 
 > The display sits on top of the Pi — no breadboard or extra wiring needed unless you add the toggle switch.
+
+> ⚠️ **The power supply makes or breaks display performance.** The Pi throttles
+> whenever the 5 V rail dips below 4.63 V: the CPU is capped at half speed
+> (600 MHz) and the core clock — **which the SPI display bus is derived from** —
+> drops from 400 to 250 MHz. The result is a silently slow, jittery display
+> with no error message anywhere; a generic "5 V" phone charger typically sits
+> just above the trip point and sags below it under load, and a thin micro-USB
+> cable can ruin even a good adapter. This is why the official supply is
+> **5.1 V**: it holds voltage at the connector under full load. Check yours
+> with `vcgencmd get_throttled` — anything other than `throttled=0x0` means
+> power problems (bit 0 = under-voltage right now, bit 16 = it has happened
+> since boot). During development this exact issue silently halved this
+> project's frame rate for months.
 
 ---
 
@@ -101,9 +115,9 @@ Then log out and back in.
 A continuously rotating 3D globe showing the current ISS position with a glowing marker. Two telemetry bars overlay the globe:
 
 - **Top bar** — LAT (latitude), LON (longitude), OVER (region the ISS is flying over)
-- **Bottom bar** — ALT (altitude in km), VEL (velocity in km/h), LAST (seconds since last data update)
+- **Bottom bar** — ALT (altitude in km), VEL (velocity in km/h), LAST (time since last data update — `38s`, `12m`, `47h`)
 
-Position is fetched every 30 seconds and interpolated between updates for smooth tracking.
+Position is fetched every 30 seconds and interpolated between updates for smooth tracking. Dead reckoning is capped at 5 minutes past the last real fix; if data is more than 10 minutes old the OVER cell switches to an amber **NO LINK** flag and the marker holds at the last known position.
 
 ### People in Space
 
@@ -153,7 +167,7 @@ systemctl --user start iss-display.service
 
 - **Watchdog** — restarts the process if it stops responding (60s timeout)
 - **Auto-restart** — recovers from crashes automatically
-- **Memory cap** — limits usage to 250 MB
+- **Memory cap** — limits usage to 450 MB
 - **Graceful shutdown** — turns off the backlight and releases GPIO on stop
 
 ### Common commands
@@ -163,6 +177,42 @@ systemctl --user status iss-display       # Check status
 journalctl --user -u iss-display -f       # Follow live logs
 systemctl --user restart iss-display      # Restart (e.g. after config changes)
 systemctl --user stop iss-display         # Stop
+```
+
+---
+
+## System Resilience (recommended for 24/7 operation)
+
+The app keeps running through network outages (it shows the last known
+position with an amber **NO LINK** flag and a humanized **LAST** age), but
+some failures can only be fixed below the application: in August 2026 the
+Pi's `brcmfmac` Wi-Fi driver hung at the kernel level, leaving NetworkManager
+and wpa_supplicant in unkillable D-state for 47 hours until a manual power
+cycle. `deploy/install-system.sh` installs three system-level safeguards
+against that class of failure:
+
+```bash
+cd ~/iss-tracker/deploy
+sudo ./install-system.sh
+```
+
+- **Connectivity watchdog** (`net-watchdog.timer`, every 2 min) — on outage,
+  escalates through recovery stages: restart NetworkManager → cycle the Wi-Fi
+  radio (10 min) → reload the `brcmfmac` driver (20 min) → forced reboot
+  (45 min, at most one per 2 h). Every action runs in a detached transient
+  unit so a hung stage can't wedge the watchdog itself. If the gateway is
+  reachable but DNS is dead (upstream/ISP outage a reboot can't fix),
+  escalation stops after the NetworkManager restart.
+- **Hardware watchdog** — Raspberry Pi OS already arms the BCM2835 runtime
+  watchdog (1 min); the drop-in adds `RebootWatchdogSec=2min` so even a
+  reboot wedged on hung kernel tasks completes via hardware reset.
+- **Wi-Fi power save off** — a known trigger for `brcmfmac` SDIO firmware
+  hangs, and pointless on a mains-powered appliance.
+
+Watch the watchdog's decisions with:
+
+```bash
+journalctl -u net-watchdog -f
 ```
 
 ---
@@ -179,7 +229,7 @@ systemctl --user stop iss-display         # Stop
 | `GPIO_RST` | `27` | LCD reset pin |
 | `GPIO_BL` | `18` | LCD backlight pin |
 | `GPIO_TOGGLE` | `17` | View toggle switch pin |
-| `SPI_SPEED_HZ` | `48000000` | SPI clock speed (do not increase) |
+| `SPI_SPEED_HZ` | `48000000` | SPI clock speed. 66.7 MHz verified on this unit with a pinned 400 MHz core; per-panel — validate with `bench/display_bench.py` before raising |
 | `PREVIEW_ONLY` | `false` | Set to `true` to generate PNGs instead of driving the LCD |
 | `ISS_LOG_LEVEL` | `INFO` | Log verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
 
@@ -205,13 +255,16 @@ Styles cascade: `hud base → bar base → element override`. Set a style broadl
 
 ## Globe Frame Cache
 
-The 3D globe is rendered as 240 pre-computed frames using [Cartopy](https://scitools.org.uk/cartopy). These are cached at `var/frame_cache/globe_240f.npz`.
+The 3D globe is rendered as 480 pre-computed frames (`num_frames` in `theme.toml`) using [Cartopy](https://scitools.org.uk/cartopy). Two caches live in `var/frame_cache/`:
 
-- **First run** — generates all frames (~2–4 minutes on Pi 4, longer on Pi 3)
-- **Subsequent runs** — loads from cache (~3 seconds)
-- **Regenerate** — delete `var/frame_cache/` (needed after changing globe colors or `num_frames` in `theme.toml`)
+- `globe_480f.npz` — the rendered RGB frames (Cartopy output)
+- `globe_480f_rgb565_320x480.npy` — the display-ready RGB565 conversion
 
-> **SPI bandwidth ceiling.** A full 320×480 RGB565 frame is 307 KB; over the 48 MHz SPI bus that's ~51 ms per frame, which caps full-frame writes at ~10–12 FPS realistic. The renderer mitigates this by sending only the globe disc (~17 ms) when the HUD hasn't changed and only the marker bbox (~1 ms) when the globe hasn't either. Don't expect 60 FPS — it's not physically possible on this hardware.
+- **First run** — generates frames (~2–4 minutes on Pi 4, longer on Pi 3), then converts to RGB565 (~4.5 minutes on Pi 3) and caches both
+- **Subsequent runs** — loads the RGB565 cache directly in a few seconds (the `.npz` isn't even opened)
+- **Regenerate** — delete `var/frame_cache/` (needed after changing globe colors or `num_frames` in `theme.toml`); deleting only the `.npz` and regenerating it also invalidates the RGB565 cache automatically (mtime comparison)
+
+> **SPI bandwidth ceiling.** A full 320×480 RGB565 frame is 307 KB. The SPI clock is derived from the Pi's **core clock** (SCLK = core / even divisor), so the requested `SPI_SPEED_HZ` only means what it says when the core clock is pinned (`core_freq=400` + `core_freq_min=400` in config.txt) and the PSU is healthy (`vcgencmd get_throttled` = `0x0`) — an under-volted or scaling core silently ran this bus at 25 MHz for months. At the measured 66.7 MHz (verified artifact-free on this panel; see `bench/RESULTS.md`), a full frame takes ~38 ms and a globe-disc region ~13 ms, supporting the 34 FPS rotation (480 frames / 14 s). Full-screen 60 FPS remains physically impossible (~148 Mbit/s needed), but disc-region updates have headroom to ~76 FPS.
 
 To speed things up, you can generate the cache on a faster machine and copy it over:
 
@@ -231,7 +284,13 @@ iss-tracker/
 ├── .env.example                        # Environment variable template
 ├── pyproject.toml                      # Package metadata and dependencies
 ├── deploy/
-│   └── iss-display.service             # systemd user service
+│   ├── iss-display.service             # systemd user service
+│   ├── install-system.sh               # installs the system-level safeguards below
+│   ├── net-watchdog.sh                 # staged network recovery script
+│   ├── net-watchdog.service            # oneshot unit running the script
+│   ├── net-watchdog.timer              # fires the check every 2 minutes
+│   ├── 10-hardware-watchdog.conf       # systemd hardware-watchdog drop-in
+│   └── wifi-powersave-off.conf         # NetworkManager Wi-Fi powersave drop-in
 ├── src/iss_display/
 │   ├── app/main.py                     # Entry point, main loop, view toggling
 │   ├── display/lcd_driver.py           # ST7796S SPI driver, rendering engine
@@ -253,6 +312,16 @@ iss-tracker/
 
 **Display is blank or freezes after a few seconds**
 The SPI buffer size is probably still at the 4 KB default. Follow step 3 in Quick Start to increase it to 307,200 bytes, then reboot.
+
+**Globe rotation is slow or jittery**
+Almost always power. Run `vcgencmd get_throttled` — anything other than
+`throttled=0x0` means the Pi is (or has been) under-voltage and is silently
+running the CPU and the SPI display bus at reduced, fluctuating speed. Use a
+5.1 V supply (official recommended) and a short, thick USB cable, and verify
+`0x0` under load. Also pin the core clock (`core_freq=400` +
+`core_freq_min=400` in `/boot/firmware/config.txt`) so the SPI clock can't
+wander with system load. `bench/display_bench.py` measures the actual
+achieved SPI throughput and frame rates on your hardware.
 
 **Permission denied on SPI or GPIO**
 Add your user to the `gpio` and `spi` groups: `sudo usermod -a -G gpio,spi $USER`, then log out and back in.
