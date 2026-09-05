@@ -306,9 +306,10 @@ class ViewToggle:
         self._prev_view = self.ISS_VIEW
 
         if not preview_mode and _HW_AVAILABLE:
-            # GPIO.setmode already called by ST7796S._init_gpio() before us
+            GPIO.setwarnings(False)
+            GPIO.setmode(GPIO.BCM)
             GPIO.setup(self._pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-            logger.info("Toggle switch initialized on GPIO %d", self._pin)
+            logger.info("Toggle switch initialized on BCM GPIO %d", self._pin)
         else:
             logger.info("Toggle switch: preview mode, defaulting to ISS view")
 
@@ -321,9 +322,9 @@ class ViewToggle:
 
         try:
             pin_state = GPIO.input(self._pin)
-            # LOW (0) = switch closed to GND = ISS view
-            # HIGH (1) = switch open, pulled up = Crew view
-            self._current_view = self.CREW_VIEW if pin_state else self.ISS_VIEW
+            # HIGH (1) = switch open, pulled up = ISS view
+            # LOW (0) = switch closed to GND = Crew view
+            self._current_view = self.ISS_VIEW if pin_state else self.CREW_VIEW
         except Exception as e:
             logger.warning("Toggle switch read failed: %s", e)
 
@@ -643,7 +644,7 @@ def run_loop(settings: Settings) -> None:
 
     # Toggle switch: GPIO input, or preview mode fallback
     preview_mode = settings.preview_only or not _HW_AVAILABLE
-    toggle = ViewToggle(settings.gpio_toggle, preview_mode)
+    toggle = ViewToggle(26, preview_mode)
 
     def signal_handler(sig, frame):
         nonlocal running

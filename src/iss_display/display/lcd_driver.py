@@ -321,6 +321,68 @@ class ST7796S:
         logger.info("Display shut down cleanly")
 
 
+
+class FramebufferDisplay:
+    """Write RGB565 frames directly to the Linux framebuffer."""
+
+    def __init__(self, settings: Settings, device: str = "/dev/fb1"):
+        self.width = settings.display_width
+        self.height = settings.display_height
+        self.device = device
+        self.reinit_occurred = False
+        self._fb = None
+        self._open()
+
+    def _open(self):
+        if self._fb is not None:
+            try:
+                self._fb.close()
+            except Exception:
+                pass
+
+        # Unbuffered access is preferable for a framebuffer device.
+        self._fb = open(self.device, "r+b", buffering=0)
+        logger.info(
+            f"Framebuffer display opened: {self.device} "
+            f"({self.width}x{self.height}, RGB565)"
+        )
+
+    def _recover(self):
+        """Reopen the framebuffer after an I/O error."""
+        self._open()
+        self.reinit_occurred = True
+
+    def display_raw(self, frame_buf):
+        """Rotate the 320x480 render into the 480x320 framebuffer."""
+        pixels = np.frombuffer(frame_buf, dtype=">u2").reshape(
+            self.height, self.width
+        )
+
+        # Rotate portrait render 90 degrees counter-clockwise into landscape.
+        rotated = np.rot90(pixels, -1)
+
+        # Linux framebuffer expects little-endian RGB565 words.
+        framebuffer_bytes = rotated.byteswap().tobytes(order="C")
+
+        self._fb.seek(0)
+        self._fb.write(framebuffer_bytes)
+
+    def display_region(self, x0, y0, x1, y1, frame_buf_np):
+        """Write a rotated full frame.
+
+        Partial portrait regions map awkwardly into the landscape framebuffer,
+        so use a complete write for correctness.
+        """
+        self.display_raw(frame_buf_np.tobytes(order="C"))
+
+    def close(self):
+        if self._fb is not None:
+            try:
+                self._fb.close()
+            finally:
+                self._fb = None
+
+
 class LcdDisplay:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -328,19 +390,16 @@ class LcdDisplay:
         self.height = settings.display_height
         self._bytes_per_row = self.width * 2  # 2 bytes per pixel (RGB565)
 
-        self.driver: Optional[ST7796S] = None
-        if not settings.preview_only and HARDWARE_AVAILABLE:
+        self.driver: Optional[FramebufferDisplay] = None
+        if not settings.preview_only:
             try:
-                self.driver = ST7796S(settings)
-                logger.info("Hardware display initialized")
+                self.driver = FramebufferDisplay(settings, "/dev/fb1")
+                logger.info("Framebuffer hardware display initialized")
             except Exception as e:
-                logger.error(f"Failed to initialize hardware display: {e}")
+                logger.error(f"Failed to initialize framebuffer display: {e}")
                 self.driver = None
         else:
-            if not HARDWARE_AVAILABLE:
-                logger.warning("Hardware libraries not found. Running in preview mode.")
-            else:
-                logger.info("Running in preview-only mode")
+            logger.info("Running in preview-only mode")
 
         # Globe geometry (computed once during frame generation)
         self.globe_scale = THEME.globe.scale
